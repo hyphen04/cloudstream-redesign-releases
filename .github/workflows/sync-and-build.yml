@@ -1,0 +1,163 @@
+# CloudStream+ daily pipeline
+# 1. pull recloudstream/cloudstream master into the private repo's `upstream` branch
+# 2. merge it into `main` (the redesign)
+# 3. build + sign the APK, and only if that works push `main` and publish a release here
+# Conflicts or build failures open an issue instead; the phone keeps the last good build.
+name: Sync and build
+
+on:
+  schedule:
+    - cron: "17 3 * * *" # daily 03:17 UTC
+  workflow_dispatch:
+    inputs:
+      force:
+        description: "Build even if nothing changed"
+        type: boolean
+        default: false
+
+permissions:
+  contents: write
+  issues: write
+
+concurrency:
+  group: sync-and-build
+  cancel-in-progress: false
+
+env:
+  PRIVATE_REPO: git@github.com:hyphen04/cloudstream-redesign.git
+  UPSTREAM_REPO: https://github.com/recloudstream/cloudstream.git
+
+jobs:
+  sync-build-release:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - name: Check out releases repo
+        uses: actions/checkout@v4
+        with:
+          path: releases
+
+      - name: Set up SSH deploy key
+        run: |
+          mkdir -p ~/.ssh
+          echo "${{ secrets.DEPLOY_KEY }}" > ~/.ssh/id_ed25519
+          chmod 600 ~/.ssh/id_ed25519
+          ssh-keyscan github.com >> ~/.ssh/known_hosts
+
+      - name: Clone private repo and fetch upstream
+        run: |
+          git clone --quiet "$PRIVATE_REPO" src
+          cd src
+          git config user.name "cloudstream-plus-bot"
+          git config user.email "cloudstream-plus-bot@users.noreply.github.com"
+          git remote add official "$UPSTREAM_REPO"
+          git fetch --quiet official master
+          git fetch --quiet origin upstream
+
+      - name: Merge upstream into main
+        id: merge
+        run: |
+          cd src
+          git checkout --quiet main
+          echo "upstream_sha=$(git rev-parse official/master)" >> "$GITHUB_OUTPUT"
+          if git merge --no-edit official/master -m "Merge upstream $(git rev-parse --short official/master)"; then
+            echo "conflict=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "conflict=true" >> "$GITHUB_OUTPUT"
+            git diff --name-only --diff-filter=U > ../conflicts.txt
+            exit 1
+          fi
+          echo "head=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+
+      - name: Decide whether to build
+        id: decide
+        run: |
+          last=$(cat releases/last-built.txt 2>/dev/null || echo none)
+          if [ "${{ steps.merge.outputs.head }}" = "$last" ] && [ "${{ inputs.force }}" != "true" ]; then
+            echo "Nothing new since $last"
+            echo "build=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "build=true" >> "$GITHUB_OUTPUT"
+            echo "last=$last" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Set up JDK 17
+        if: steps.decide.outputs.build == 'true'
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 17
+
+      - name: Set up Gradle
+        if: steps.decide.outputs.build == 'true'
+        uses: gradle/actions/setup-gradle@v4
+
+      - name: Build signed APK
+        if: steps.decide.outputs.build == 'true'
+        env:
+          PLUS_KEYSTORE_PASSWORD: ${{ secrets.KEYSTORE_PASSWORD }}
+          PLUS_KEY_PASSWORD: ${{ secrets.KEYSTORE_PASSWORD }}
+          PLUS_KEY_ALIAS: ${{ secrets.KEY_ALIAS }}
+          PLUS_BUILD_NUMBER: ${{ github.run_number }}
+        run: |
+          echo "${{ secrets.KEYSTORE_B64 }}" | base64 -d > "$RUNNER_TEMP/plus.jks"
+          export PLUS_KEYSTORE_FILE="$RUNNER_TEMP/plus.jks"
+          cd src
+          ./gradlew :app:assembleStableRelease --no-configuration-cache
+          rm -f "$RUNNER_TEMP/plus.jks"
+
+      - name: Push merged main
+        if: steps.decide.outputs.build == 'true'
+        run: |
+          cd src
+          git push --quiet origin official/master:refs/heads/upstream
+          git push --quiet origin main
+
+      - name: Publish release
+        if: steps.decide.outputs.build == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          cd src
+          IFS=. read -r ma mi pa <<< "$(sed -nE 's/^versionName = "([0-9.]+).*"/\1/p' gradle/libs.versions.toml)"
+          n=$(( ${{ github.run_number }} % 1000 ))
+          ver="$ma.$mi.$(( pa * 1000 + n ))"
+          apk=$(find app/build/outputs/apk/stable/release -name '*.apk' | head -n1)
+          cp "$apk" "../CloudStream-Plus-$ver.apk"
+          last="${{ steps.decide.outputs.last }}"
+          {
+            echo "Built from \`$(git rev-parse --short HEAD)\` (official \`$(git rev-parse --short official/master)\`)."
+            echo
+            echo "### Changes"
+            if git cat-file -e "$last^{commit}" 2>/dev/null; then
+              git log --no-merges --pretty='- %s' "$last..HEAD" | head -40
+            else
+              git log --no-merges --pretty='- %s' -15
+            fi
+          } > ../notes.md
+          cd ../releases
+          gh release create "v$ver" "../CloudStream-Plus-$ver.apk" --title "CloudStream+ $ver" --notes-file ../notes.md --latest
+          echo "${{ steps.merge.outputs.head }}" > last-built.txt
+          git config user.name "cloudstream-plus-bot"
+          git config user.email "cloudstream-plus-bot@users.noreply.github.com"
+          git add last-built.txt
+          git commit --quiet -m "Built $ver"
+          git push --quiet
+
+      - name: Open issue on failure
+        if: failure()
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          cd releases
+          if [ "${{ steps.merge.outputs.conflict }}" = "true" ]; then
+            title="Merge conflict with upstream $(echo ${{ steps.merge.outputs.upstream_sha }} | cut -c1-7)"
+            body=$(printf "Upstream changes conflict with the redesign. The last good build stays installed.\n\nConflicting files:\n\n\`\`\`\n%s\n\`\`\`\n\nRun: %s" "$(cat ../conflicts.txt)" "$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID")
+          else
+            title="Build failed (run ${{ github.run_number }})"
+            body="The sync or build failed; nothing was released. Logs: $GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID"
+          fi
+          # one open issue per problem: skip if an identical title is already open
+          if ! gh issue list --state open --search "\"$title\" in:title" --json number --jq '.[0].number' | grep -q .; then
+            gh issue create --title "$title" --body "$body"
+          fi
